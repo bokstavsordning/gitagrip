@@ -1,0 +1,296 @@
+#!/usr/bin/env sh
+
+MAX_LOG_LINES=30
+COLS=$(stty size | awk '{print $2}')
+
+if [ -x "$(command -v delta)" ]; then
+  PAGER="delta --line-numbers true --side-by-side true --plus-style 'syntax black' --minus-style 'syntax black strike' --minus-emph-style 'syntax reverse strike' --plus-emph-style 'syntax reverse' --hunk-header-style omit -w $COLS || git diff --color"
+else
+  PAGER="less"
+fi
+
+# Please note that the script assumes %h first
+GIT_LOG_FORMAT='%C(blue)%h %C(green)(%ar)%C(reset)%C(bold) %s %C(reset)%C(10)- %an%C(reset)%C(cyan)%d%C(reset)'
+#  GIT_LOG_FORMAT='%h %C(green)(%ar)%C(reset) %C(bold)%s%C(reset) - %C(dim)%an%C(reset)%d'
+GIT_IN_FORMAT='%C(blue)%h%C(reset) %C(green)(%ar)%C(reset) %C(bold)%s%C(reset) %C(10)- %an%C(reset)%C(cyan)%d%C(reset)'
+
+is_inside_work_tree() { git rev-parse --is-inside-work-tree >/dev/null; }
+
+show_spinner() {
+  pid=$!
+  i=0
+  while ps -a | awk '{print $1}' | grep -q "${pid}"; do
+    # c=$(expr ${i} % 8)
+    # case ${c} in
+    # 0) printf "⣾\b" ;;
+    # 1) printf "⣷\b" ;;
+    # 2) printf "⣯\b" ;;
+    # 3) printf "⣟\b" ;;
+    # 4) printf "⡿\b" ;;
+    # 5) printf "⢿\b" ;;
+    # 6) printf "⣻\b" ;;
+    # 7) printf "⣽\b" ;;
+    # esac
+
+    # c=`expr ${i} % 6`
+    # case ${c} in
+    #    0) printf "\b·" ;;
+    #    1) printf "\b-" ;;
+    #    2) printf "\b—" ;;
+    #    3) printf "\b—" ;;
+    #    4) printf "\b-" ;;
+    #    5) printf "\b·" ;;
+    # esac
+
+    c=$(expr ${i} % 4)
+    case ${c} in
+    0) printf "\b|" ;;
+    1) printf "\b/" ;;
+    2) printf "\b-" ;;
+    3) printf "\b\\" ;;
+    esac
+
+    i=$(expr ${i} + 1)
+    sleep 0.1
+  done
+
+  printf " \b\b"
+
+  wait ${pid}
+  return $?
+}
+
+git_fetch() {
+  (git fetch --prune 2>&1 > /dev/null) &
+  show_spinner "$!"
+}
+
+fzf_up() {
+  fzf --ansi --multi --exit-0 --bind='enter:abort' --bind='?:toggle-preview' --preview-window=up:70%,cycle "$@"
+}
+
+git_alldirs() {
+  for i in *; do
+    if [ -d "$i/.git" ]; then
+      branch=$(git --git-dir $i/.git rev-parse --abbrev-ref HEAD)
+      modified=$(git --git-dir $i/.git --work-tree $i diff --shortstat)
+      printf "\033[4;49;34m\n$i\033[0m [$branch]\033[2;49;37m$modified\033[0m\n"
+      git --git-dir $i/.git --work-tree $i "$@"
+    fi
+  done
+}
+
+git_diff() {
+  git -c color.status=always status --short --branch |
+    fzf_up \
+      --no-sort \
+      --header="+ to add, CTRL-P to commit and push" \
+      --header-lines=1 \
+      --bind='+:execute-silent(git add {-1})+reload(git -c color.status=always status --short --branch)+down' \
+      --bind='ctrl-p:execute(git commit --quiet && git push --quiet --progress)+abort' \
+      --bind='enter:abort' \
+      --preview "git ls-files --others --exclude-standard {-1} | xargs git diff /dev/null 2>/dev/null || git diff --color=always {-1} | $PAGER"
+}
+
+git_log() {
+  git log --graph --abbrev-commit --date=relative --decorate --format=format:"$GIT_LOG_FORMAT" --max-count $MAX_LOG_LINES $@
+}
+
+git_fzf_log() {
+  is_inside_work_tree || exit 1
+
+  BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+
+  git_log $@ --color=always |
+    fzf_up \
+      --header "Current branch is $BRANCH. ALT-A to show all branches. ALT-C to (re)load current branch." \
+      --preview-window=up,75%,~6 \
+      --bind "alt-t:reload(git_log $@ --color=always)" \
+      --bind "alt-t:reload(git_log $@ --color=always $BRANCH)" \
+      --preview "echo {} | tr -d '*| ' | cut -d \( -f1 | xargs -I% git show --color=always % | $PAGER" #delta -w $COLS || git diff --color"
+}
+
+git_branches() {
+  git_fetch
+
+  FZF_DEFAULT_COMMAND="git branch --all --sort=-committerdate --color=always"
+
+  fzf_up \
+    --query=$@ \
+    --no-sort \
+    --header="ENTER to checkout, ALT-B (re)loads branches, ALT-T (re)loads tags, ALT-F git fetch" \
+    --bind "enter:execute(echo {-1} | grep -o '[^/]*$' | xargs git checkout)+abort" \
+    --bind "alt-b:reload($FZF_DEFAULT_COMMAND)" \
+    --bind "alt-t:reload(git tag --sort=-committerdate)" \
+    --bind "alt-f:execute-silent(git fetch --prune)" \
+    --preview "git log --color --graph --abbrev-commit --decorate --format=format:'$GIT_LOG_FORMAT' --max-count -15 {-1}"
+}
+
+git_list_gone_branches() {
+  git_fetch
+
+  FZF_DEFAULT_COMMAND="git for-each-ref --format '%(refname:short) %(upstream:track)' | grep gone || true"
+
+  fzf_up \
+    --query=$@ \
+    --header="The following branches are gone. DELETE to delete them locally." \
+    --bind="del:execute-silent(git branch --delete --force {+1})+reload(${FZF_DEFAULT_COMMAND})" \
+    --preview="git log --color --graph --abbrev-commit --decorate --format=format:'$GIT_LOG_FORMAT' --max-count -15 {1}"
+}
+
+git_stash() {
+  git stash list --color=always |
+    fzf_up \
+      --no-sort \
+      --no-multi \
+      --header="ALT-A apply | ALT-P pop | ALT-D drop" \
+      --bind='alt-a:execute(echo {} | cut -d: -f1 | xargs -I% git stash apply %)+abort' \
+      --bind='alt-p:execute(echo {} | cut -d: -f1 | xargs -I% git stash pop %)+abort' \
+      --bind='alt-d:execute(echo {} | cut -d: -f1 | xargs -I% git stash drop %)+abort' \
+      --delimiter=":" \
+      --preview-window=up,70%,~6 \
+      --preview "git stash show {1} --color=always --ext-diff | $PAGER"
+}
+
+git_log_incoming() {
+  git log --pretty=oneline --abbrev-commit --graph ..@{u} --decorate --max-count $MAX_LOG_LINES --format=format:"$GIT_IN_FORMAT" $@
+}
+
+git_in() {
+  git_fetch
+  git_log_incoming
+}
+
+git_fzf_in() {
+  git_log_incoming $@ |
+    fzf_up \
+      --preview "git show --color=always {1} | $PAGER"
+}
+
+git_list_authors() {
+  git log --format='%aN <%aE>' | sort | uniq -c | sort -rn
+}
+
+git_search_history() {
+  INITIAL_QUERY="${1:-%}"
+
+  if [ -n "$2" ]; then
+    SEARCH_USER="--author=${2}"
+    USER_HEADER="[Author: ${2}]"
+  fi 
+
+  GIT_PREFIX="git log --color --oneline $SEARCH_USER -S"
+
+  eval "$GIT_PREFIX $INITIAL_QUERY" | fzf --ansi \
+    --disabled \
+    --header="F1: git blame $USER_HEADER" \
+    --query "$INITIAL_QUERY" \
+    --bind "change:reload:sleep 0.1; $GIT_PREFIX {q} || true" \
+    --bind 'f1:execute(git blame {1})' \
+    --bind 'enter:abort' \
+    --preview-window=up,70%,~6 \
+    --preview "git show {1} --color=always --ext-diff | $PAGER"
+}
+
+churn() {
+  git log --all -M -C --name-only --format='format:' "$@" |
+    sort |
+    grep -v '^$' |
+    uniq -c |
+    sort -nr
+}
+
+batdiff() {
+  is_inside_work_tree || exit 1
+  git diff --name-only --diff-filter=d | xargs bat --style=full --diff
+}
+
+shortlist() {
+  echo all diff log-short log branches branches-gone stashes incoming-short incoming search-history bat-diff contributors shortlist churn | sort
+}
+
+print_usage() {
+  cat <<EOF
+  Usage: $(basename $0) [command] <arguments>
+
+  all                   Repeat same git command for all git folders in current folder.
+  diff                  Perform git diff, list in fzf with preview.
+  ls, log-short         Perform git log with nice formatting
+  log                   Perform git log, list in fzf with preview.
+  branches              List git branches in fzf. Preview is log of branch
+  branches-gone         List git branches, marked as gone, in fzf. Preview is log.
+  stashes               List git stashes in fzf. Preview is diff of stash.
+  ins, incoming-short   List incoming changs with nice formatting.
+  in, incoming          List incoming changs in fzf. Preview is git show.
+  contributors          List contributors, sorted by number of contributions.
+  churn                 List most edited files.
+  sh, search-history    Interactive search of git history in fzf. Optional arguments: <search term> <author>.
+  bd, bat-diff          Use bat as git diff tool
+  shortlist             List of above commands. For shell completions.
+  -h, --help
+
+  Note: This tool assumes that the following is installed: git, fzf.
+        If available delta will be used, otherwise the tool will fall back on less
+        bat-diff assumes that bat is installed.
+EOF
+}
+
+case $1 in
+all)
+  shift
+  git_alldirs $@
+  ;;
+diff)
+  shift
+  git_diff $@
+  ;;
+ls | log-short)
+  shift
+  git_log $@
+  ;;
+log)
+  shift
+  git_fzf_log $@
+  ;;
+branches)
+  shift
+  git_branches $@
+  ;;
+branches-gone)
+  shift
+  git_list_gone_branches $@
+  ;;
+stashes)
+  shift
+  git_stash $@
+  ;;
+ins | incoming-short)
+  shift
+  git_in $@
+  ;;
+in | incoming)
+  shift
+  git_fzf_in $@
+  ;;
+sh | search-history)
+  shift
+  git_search_history $@
+  ;;
+bd | bat-diff)
+  batdiff
+  ;;
+contributors)
+  shift
+  git_list_authors $@
+  ;;
+churn)
+  shift
+  churn $@
+  ;;
+shortlist)
+  shortlist
+  ;;
+-h | --help | *)
+  print_usage
+  ;;
+esac
